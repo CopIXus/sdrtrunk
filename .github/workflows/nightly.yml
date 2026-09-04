@@ -10,6 +10,8 @@ on:
 
 jobs:
   nightly:
+    # Upstream-only: the CopIXus fork publishes tagged builds via radiotak-release.yml.
+    if: github.repository == 'DSheirer/sdrtrunk'
     runs-on: ubuntu-latest
 
     steps:
