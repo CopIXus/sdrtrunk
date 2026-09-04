@@ -23,6 +23,7 @@ import io.github.dsheirer.buffer.INativeBuffer;
 import io.github.dsheirer.controller.channel.Channel;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
+import io.github.dsheirer.export.DftFrameExporter;
 import io.github.dsheirer.dsp.filter.smoothing.SmoothingFilter.SmoothingType;
 import io.github.dsheirer.dsp.window.WindowType;
 import io.github.dsheirer.eventbus.MyEventBus;
@@ -103,6 +104,7 @@ public class SpectralDisplayPanel extends JPanel
     private OverlayPanel mOverlayPanel;
     private ComplexDftProcessor mComplexDftProcessor;
     private DFTResultsConverter mDFTConverter;
+    private DftFrameExporter mDftFrameExporter;
     private ChannelModel mChannelModel;
     private ChannelProcessingManager mChannelProcessingManager;
     private SettingsManager mSettingsManager;
@@ -171,6 +173,12 @@ public class SpectralDisplayPanel extends JPanel
         clearTuner();
 
         mSettingsManager = null;
+
+        if(mDftFrameExporter != null)
+        {
+            mDftFrameExporter.dispose();
+            mDftFrameExporter = null;
+        }
 
         mComplexDftProcessor.dispose();
         mComplexDftProcessor = null;
@@ -398,6 +406,8 @@ public class SpectralDisplayPanel extends JPanel
 
         mDFTConverter.addListener((DFTResultsListener)mSpectrumPanel);
         mDFTConverter.addListener((DFTResultsListener)mWaterfallPanel);
+        mDftFrameExporter = new DftFrameExporter(mOverlayPanel, mChannelModel);
+        mDFTConverter.addListener(mDftFrameExporter);
     }
 
     /**
