@@ -39,7 +39,7 @@ jobs:
 
       - name: Create Build Info file
         run: |
-          echo -e "ref: $GITHUB_REF \ncommit: $GITHUB_SHA\nbuild: $(date +"%Y-%m-%dT%H:%M:%SZ")\nradiotak: DftFrameExporter+GeoEventJsonExporter" > build/image/build_info.txt
+          echo -e "ref: $GITHUB_REF \ncommit: $GITHUB_SHA\nbuild: $(date +"%Y-%m-%dT%H:%M:%SZ")\nradiotak: DftFrameExporter+GeoEventJsonExporter+TrafficKeyStore" > build/image/build_info.txt
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2

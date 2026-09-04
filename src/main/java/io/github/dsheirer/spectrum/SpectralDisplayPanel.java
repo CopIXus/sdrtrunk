@@ -406,7 +406,7 @@ public class SpectralDisplayPanel extends JPanel
 
         mDFTConverter.addListener((DFTResultsListener)mSpectrumPanel);
         mDFTConverter.addListener((DFTResultsListener)mWaterfallPanel);
-        mDftFrameExporter = new DftFrameExporter(mOverlayPanel, mChannelModel);
+        mDftFrameExporter = new DftFrameExporter(mOverlayPanel, mChannelModel, this::getTuner);
         mDFTConverter.addListener(mDftFrameExporter);
     }
 
@@ -459,6 +459,10 @@ public class SpectralDisplayPanel extends JPanel
                 process(SourceEvent.sampleRateChange(mTuner.getTunerController().getSampleRate()));
             }
         }
+        if(mDftFrameExporter != null)
+        {
+            mDftFrameExporter.bindTuner(mTuner);
+        }
     }
 
     /**
@@ -466,6 +470,10 @@ public class SpectralDisplayPanel extends JPanel
      */
     public void clearTuner()
     {
+        if(mDftFrameExporter != null)
+        {
+            mDftFrameExporter.bindTuner(null);
+        }
         if(mTuner != null)
         {
             //Deregister for frequency change events from the tuner
