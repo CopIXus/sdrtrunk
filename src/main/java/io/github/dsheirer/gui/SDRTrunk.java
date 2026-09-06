@@ -30,6 +30,7 @@ import io.github.dsheirer.controller.channel.Channel;
 import io.github.dsheirer.controller.channel.ChannelAutoStartFrame;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelSelectionManager;
+import io.github.dsheirer.export.AudioFrameExporter;
 import io.github.dsheirer.export.GeoEventJsonExporter;
 import io.github.dsheirer.eventbus.MyEventBus;
 import io.github.dsheirer.gui.icon.ViewIconManagerRequest;
@@ -216,6 +217,7 @@ public class SDRTrunk implements Listener<TunerEvent>
         mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(audioPlaybackManager);
         mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(mAudioRecordingManager);
         mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(mAudioStreamingManager);
+        mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(new AudioFrameExporter());
 
         MapService mapService = new MapService(aliasModel, mIconModel);
         mPlaylistManager.getChannelProcessingManager().addDecodeEventListener(mapService);
