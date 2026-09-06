@@ -1,4 +1,4 @@
-/*
+*
  * *****************************************************************************
  * Copyright (C) 2014-2026 Dennis Sheirer
  * Copyright (C) 2026 CopIXus / RadioTAK
@@ -14,14 +14,17 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>
  * ****************************************************************************
  */
 package io.github.dsheirer.export;
 
 import io.github.dsheirer.channel.IChannelDescriptor;
+import io.github.dsheirer.identifier.Form;
 import io.github.dsheirer.identifier.Identifier;
 import io.github.dsheirer.identifier.IdentifierCollection;
+import io.github.dsheirer.identifier.encryption.EncryptionKey;
+import io.github.dsheirer.identifier.encryption.EncryptionKeyIdentifier;
 import io.github.dsheirer.module.decode.event.DecodeEventType;
 import io.github.dsheirer.module.decode.event.IDecodeEvent;
 import io.github.dsheirer.module.decode.event.PlottableDecodeEvent;
@@ -29,6 +32,7 @@ import io.github.dsheirer.properties.SystemProperties;
 import io.github.dsheirer.protocol.Protocol;
 import io.github.dsheirer.sample.Listener;
 import java.time.Instant;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -40,11 +44,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Streams PlottableDecodeEvent GPS and encrypted/clear call metadata as NDJSON
+ * Streams PlottableDecodeEvent GPS and call / identity metadata as NDJSON
  * to RadioTAK (default 127.0.0.1:29500).
  *
  * Isolated from decoder/audio paths. Enable with geo_event_export_enabled in
- * SDRTrunk.properties. Call events are rate-limited per radio/talkgroup.
+ * SDRTrunk.properties. Call and ANI events are rate-limited per radio/talkgroup.
+ * Conventional analog IDs (MDC-1200, FleetSync, Tait) arrive as ID_ANI / GPS
+ * rather than CALL — those are exported whenever a source identifier is present.
+ *
+ * Extra P25 context (system/site/NAC/WACN/RFSS, timeslot, uplink, patch/status/LRA,
+ * structured ALGID/KID, Message Indicator when the decoder already printed it)
+ * is copied from IdentifierCollection. This exporter does not decrypt payloads.
  */
 public class GeoEventJsonExporter implements Listener<IDecodeEvent>
 {
@@ -56,6 +66,9 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
     private static final Pattern ALG_KEY = Pattern.compile(
         "(?:ALGORITHM|ALGID)\\s*[:=]\\s*(?:0x)?([0-9A-Fa-f]+).*?(?:KEY(?:\\s*ID)?)\\s*[:=]\\s*(?:0x)?([0-9A-Fa-f]+)",
         Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern MESSAGE_INDICATOR = Pattern.compile(
+        "(?:\\bMI\\b|MESSAGE\\s*INDICATOR)\\s*[:=]\\s*(?:0x)?([0-9A-Fa-f]{6,})",
+        Pattern.CASE_INSENSITIVE);
 
     private final NdjsonTcpClient mClient;
     private final boolean mEnabled;
@@ -94,7 +107,7 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
             return;
         }
         DecodeEventType type = decodeEvent.getEventType();
-        if(!isCallLike(type))
+        if(!isIdentityEvent(type))
         {
             return;
         }
@@ -113,7 +126,7 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
     {
         GeoPosition pos = plottable.getLocation();
         IdentifierCollection ids = plottable.getIdentifierCollection();
-        Identifier from = ids != null ? ids.getFromIdentifier() : null;
+        Identifier from = sourceIdentifier(ids);
         if(from == null || from.getValue() == null)
         {
             return;
@@ -124,17 +137,27 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
             return;
         }
 
-        StringBuilder sb = new StringBuilder(256);
+        StringBuilder sb = new StringBuilder(384);
         sb.append("{\"schema\":\"sdr2tak.location.v1\"");
         sb.append(",\"event_id\":\"").append(UUID.randomUUID()).append('"');
         sb.append(",\"decoder\":\"sdrtrunk\"");
         field(sb, "protocol", protocol(plottable));
+        field(sb, "p25_phase", p25Phase(plottable.getProtocol()));
         field(sb, "system_name", aliasListName(ids));
+        appendSystemContext(sb, ids, plottable.getChannelDescriptor());
         field(sb, "radio_id", radioId);
+        field(sb, "source_alias", identifierValue(ids, Form.TALKER_ALIAS));
         Identifier to = ids != null ? ids.getToIdentifier() : null;
         if(to != null && to.getValue() != null)
         {
-            field(sb, "talkgroup", String.valueOf(to.getValue()));
+            if(to.getForm() == Form.RADIO)
+            {
+                field(sb, "destination_radio_id", String.valueOf(to.getValue()));
+            }
+            else
+            {
+                field(sb, "talkgroup", String.valueOf(to.getValue()));
+            }
         }
         sb.append(",\"latitude\":").append(String.format(Locale.US, "%.7f", pos.getLatitude()));
         sb.append(",\"longitude\":").append(String.format(Locale.US, "%.7f", pos.getLongitude()));
@@ -148,11 +171,6 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
         {
             sb.append(",\"speed_mps\":").append(String.format(Locale.US, "%.3f", kph / 3.6));
         }
-        IChannelDescriptor channel = plottable.getChannelDescriptor();
-        if(channel != null && channel.getDownlinkFrequency() > 0)
-        {
-            sb.append(",\"frequency_hz\":").append(channel.getDownlinkFrequency());
-        }
         sb.append(",\"emergency\":").append(plottable.getEventType() == DecodeEventType.EMERGENCY);
         field(sb, "raw_event_type", plottable.getEventType() != null ? plottable.getEventType().name() : null);
         sb.append(",\"observed_at\":\"").append(Instant.ofEpochMilli(plottable.getTimeStart())).append('"');
@@ -163,7 +181,7 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
     private void emitDecode(IDecodeEvent event)
     {
         IdentifierCollection ids = event.getIdentifierCollection();
-        Identifier from = ids != null ? ids.getFromIdentifier() : null;
+        Identifier from = sourceIdentifier(ids);
         if(from == null || from.getValue() == null)
         {
             return;
@@ -174,10 +192,37 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
             return;
         }
         Identifier to = ids != null ? ids.getToIdentifier() : null;
-        String talkgroup = to != null && to.getValue() != null ? String.valueOf(to.getValue()) : "";
+        String talkgroup = "";
+        String destinationRadio = null;
+        String destinationType = null;
+        if(to != null && to.getValue() != null)
+        {
+            destinationType = to.getForm() != null ? to.getForm().name() : null;
+            if(to.getForm() == Form.RADIO)
+            {
+                destinationRadio = String.valueOf(to.getValue());
+            }
+            else
+            {
+                talkgroup = String.valueOf(to.getValue());
+            }
+        }
         DecodeEventType type = event.getEventType();
-        boolean encrypted = isEncrypted(type, event.getDetails());
-        String dedupe = radioId + "|" + talkgroup + "|" + encrypted;
+        boolean encryptionHeaderPresent = false;
+        Integer[] cipher = encryptionFromIdentifiers(ids);
+        if(cipher != null)
+        {
+            encryptionHeaderPresent = true;
+        }
+        else
+        {
+            cipher = encryptionFromDetails(event.getDetails());
+        }
+        Integer algId = cipher != null ? cipher[0] : null;
+        Integer keyId = cipher != null ? cipher[1] : null;
+        boolean encrypted = isEncrypted(type, event.getDetails()) || algId != null;
+        String dedupe = radioId + "|" + talkgroup + "|" + encrypted + "|" +
+            (algId != null ? algId : "") + "|" + (keyId != null ? keyId : "");
         long now = System.currentTimeMillis();
         Long last = mLastDecode.get(dedupe);
         if(last != null && now - last < DECODE_MIN_INTERVAL_MS)
@@ -186,22 +231,32 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
         }
         mLastDecode.put(dedupe, now);
 
-        Integer algId = encryptionAlgorithm(event.getDetails());
-        Integer keyId = encryptionKeyId(event.getDetails());
         boolean keyLoaded = mKeys.hasKey(algId, keyId);
+        String mi = messageIndicator(event.getDetails());
 
-        StringBuilder sb = new StringBuilder(256);
+        StringBuilder sb = new StringBuilder(512);
         sb.append("{\"schema\":\"sdr2tak.decode.v1\"");
         sb.append(",\"event_id\":\"").append(UUID.randomUUID()).append('"');
         sb.append(",\"decoder\":\"sdrtrunk\"");
         field(sb, "protocol", protocol(event));
+        field(sb, "p25_phase", p25Phase(event.getProtocol()));
         field(sb, "system_name", aliasListName(ids));
+        appendSystemContext(sb, ids, event.getChannelDescriptor());
         field(sb, "radio_id", radioId);
+        field(sb, "source_type", from.getForm() != null ? from.getForm().name() : null);
+        field(sb, "source_alias", identifierValue(ids, Form.TALKER_ALIAS));
         if(!talkgroup.isBlank())
         {
             field(sb, "talkgroup", talkgroup);
         }
+        field(sb, "destination_type", destinationType);
+        if(destinationRadio != null)
+        {
+            field(sb, "destination_radio_id", destinationRadio);
+        }
+        appendEntityContext(sb, ids);
         sb.append(",\"encrypted\":").append(encrypted);
+        sb.append(",\"encryption_header_present\":").append(encryptionHeaderPresent);
         sb.append(",\"key_loaded\":").append(keyLoaded);
         if(algId != null)
         {
@@ -212,10 +267,15 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
         {
             sb.append(",\"key_id\":").append(keyId);
         }
-        IChannelDescriptor channel = event.getChannelDescriptor();
-        if(channel != null && channel.getDownlinkFrequency() > 0)
+        if(mi != null)
         {
-            sb.append(",\"frequency_hz\":").append(channel.getDownlinkFrequency());
+            field(sb, "message_indicator", mi);
+            field(sb, "message_indicator_hex", mi);
+        }
+        long duration = event.getDuration();
+        if(duration > 0)
+        {
+            sb.append(",\"duration_ms\":").append(duration);
         }
         sb.append(",\"emergency\":").append(type == DecodeEventType.EMERGENCY);
         field(sb, "raw_event_type", type != null ? type.name() : null);
@@ -225,14 +285,204 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
         mClient.send(sb.toString());
     }
 
-    private static boolean isCallLike(DecodeEventType type)
+    private static void appendSystemContext(StringBuilder sb, IdentifierCollection ids,
+                                            IChannelDescriptor channel)
+    {
+        field(sb, "system_id", identifierValue(ids, Form.SYSTEM));
+        field(sb, "wacn", identifierValue(ids, Form.WACN));
+        field(sb, "nac", identifierValue(ids, Form.NETWORK_ACCESS_CODE));
+        field(sb, "site_id", identifierValue(ids, Form.SITE));
+        field(sb, "rfss", identifierValue(ids, Form.RF_SUBSYSTEM));
+        if(ids != null)
+        {
+            int slot = ids.getTimeslot();
+            if(channel != null && channel.isTDMAChannel())
+            {
+                sb.append(",\"timeslot\":").append(slot);
+            }
+            else if(slot > 0)
+            {
+                sb.append(",\"timeslot\":").append(slot);
+            }
+        }
+        if(channel != null)
+        {
+            if(channel.getDownlinkFrequency() > 0)
+            {
+                sb.append(",\"frequency_hz\":").append(channel.getDownlinkFrequency());
+            }
+            if(channel.getUplinkFrequency() > 0)
+            {
+                sb.append(",\"uplink_frequency_hz\":").append(channel.getUplinkFrequency());
+            }
+            String channelName = channel.toString();
+            if(channelName != null && !channelName.isBlank())
+            {
+                field(sb, "channel", channelName);
+            }
+        }
+        else
+        {
+            field(sb, "channel", identifierValue(ids, Form.CHANNEL_NAME));
+            String channelFreq = identifierValue(ids, Form.CHANNEL_FREQUENCY);
+            if(channelFreq != null)
+            {
+                try
+                {
+                    sb.append(",\"frequency_hz\":").append(Long.parseLong(channelFreq));
+                }
+                catch(NumberFormatException ignored)
+                {
+                    field(sb, "channel", channelFreq);
+                }
+            }
+        }
+    }
+
+    private static void appendEntityContext(StringBuilder sb, IdentifierCollection ids)
+    {
+        field(sb, "patch_group", identifierValue(ids, Form.PATCH_GROUP));
+        field(sb, "unit_status", identifierValue(ids, Form.UNIT_STATUS));
+        field(sb, "user_status", identifierValue(ids, Form.USER_STATUS));
+        field(sb, "lra", identifierValue(ids, Form.LOCATION_REGISTRATION_AREA));
+    }
+
+    private static Integer[] encryptionFromIdentifiers(IdentifierCollection ids)
+    {
+        if(ids == null)
+        {
+            return null;
+        }
+        Identifier identifier = ids.getEncryptionIdentifier();
+        if(identifier == null)
+        {
+            List<Identifier> list = ids.getIdentifiers(Form.ENCRYPTION_KEY);
+            if(list == null || list.isEmpty())
+            {
+                return null;
+            }
+            identifier = list.get(0);
+        }
+        Object value = identifier.getValue();
+        if(identifier instanceof EncryptionKeyIdentifier keyIdentifier)
+        {
+            value = keyIdentifier.getValue();
+        }
+        if(!(value instanceof EncryptionKey key) || !key.isEncrypted())
+        {
+            return null;
+        }
+        return new Integer[]{key.getAlgorithm(), key.getKey()};
+    }
+
+    private static Integer[] encryptionFromDetails(String details)
+    {
+        Matcher matcher = ALG_KEY.matcher(details == null ? "" : details);
+        if(!matcher.find())
+        {
+            return null;
+        }
+        return new Integer[]{
+            TrafficKeyStore.parseHexInt(matcher.group(1)),
+            TrafficKeyStore.parseHexInt(matcher.group(2))
+        };
+    }
+
+    private static String messageIndicator(String details)
+    {
+        if(details == null || details.isBlank())
+        {
+            return null;
+        }
+        Matcher matcher = MESSAGE_INDICATOR.matcher(details);
+        if(!matcher.find())
+        {
+            return null;
+        }
+        return matcher.group(1).toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * Voice/data calls plus identity-bearing events that do not start with CALL
+     * (MDC/FleetSync/Tait ANI, LRRP/GPS without a plottable fix, affiliation).
+     */
+    private static boolean isIdentityEvent(DecodeEventType type)
     {
         if(type == null)
         {
             return false;
         }
         String name = type.name();
-        return name.startsWith("CALL") || name.startsWith("DATA_CALL");
+        if(name.startsWith("CALL") || name.startsWith("DATA_CALL"))
+        {
+            return true;
+        }
+        switch(type)
+        {
+            case ID_ANI:
+            case ID_UNIQUE:
+            case GPS:
+            case LRRP:
+            case REGISTER:
+            case REGISTER_ESN:
+            case DEREGISTER:
+            case AFFILIATE:
+            case STATION_ID:
+            case EMERGENCY:
+            case PAGE:
+            case STATUS:
+            case RESPONSE:
+            case RADIO_CHECK:
+            case AUTOMATIC_REGISTRATION_SERVICE:
+            case RADIO_REGISTRATION_SERVICE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Prefer the FROM radio, then UNIQUE_ID / UNIT_IDENTIFIER. MDC-1200 stores
+     * ANI as a talkgroup-form identifier with Role.FROM — getFromIdentifier()
+     * already falls back to Role.FROM, so those IDs still export as radio_id.
+     */
+    private static Identifier sourceIdentifier(IdentifierCollection ids)
+    {
+        if(ids == null)
+        {
+            return null;
+        }
+        Identifier from = ids.getFromIdentifier();
+        if(from != null && from.getValue() != null)
+        {
+            return from;
+        }
+        Identifier radio = firstIdentifier(ids, Form.RADIO);
+        if(radio != null)
+        {
+            return radio;
+        }
+        Identifier unique = firstIdentifier(ids, Form.UNIQUE_ID);
+        if(unique != null)
+        {
+            return unique;
+        }
+        return firstIdentifier(ids, Form.UNIT_IDENTIFIER);
+    }
+
+    private static Identifier firstIdentifier(IdentifierCollection ids, Form form)
+    {
+        List<Identifier> list = ids.getIdentifiers(form);
+        if(list == null || list.isEmpty())
+        {
+            return null;
+        }
+        Identifier identifier = list.get(0);
+        if(identifier == null || identifier.getValue() == null)
+        {
+            return null;
+        }
+        return identifier;
     }
 
     private static boolean isEncrypted(DecodeEventType type, String details)
@@ -249,30 +499,28 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
         return upper.contains("ENCRYPTED") && !upper.contains("UNENCRYPTED");
     }
 
-    private static Integer encryptionAlgorithm(String details)
-    {
-        Matcher matcher = ALG_KEY.matcher(details == null ? "" : details);
-        if(matcher.find())
-        {
-            return TrafficKeyStore.parseHexInt(matcher.group(1));
-        }
-        return null;
-    }
-
-    private static Integer encryptionKeyId(String details)
-    {
-        Matcher matcher = ALG_KEY.matcher(details == null ? "" : details);
-        if(matcher.find())
-        {
-            return TrafficKeyStore.parseHexInt(matcher.group(2));
-        }
-        return null;
-    }
-
     private static String protocol(IDecodeEvent event)
     {
         Protocol p = event.getProtocol();
         return p == null ? null : p.name();
+    }
+
+    private static String p25Phase(Protocol protocol)
+    {
+        if(protocol == null)
+        {
+            return null;
+        }
+        String name = protocol.name().toUpperCase(Locale.ROOT);
+        if(name.contains("PHASE2") || name.contains("P2") || name.contains("TDMA"))
+        {
+            return "2";
+        }
+        if(name.contains("APCO25") || name.contains("P25") || name.contains("PHASE1"))
+        {
+            return "1";
+        }
+        return null;
     }
 
     private static String aliasListName(IdentifierCollection ids)
@@ -283,6 +531,36 @@ public class GeoEventJsonExporter implements Listener<IDecodeEvent>
         }
         Identifier alias = ids.getAliasListConfiguration();
         return alias == null || alias.getValue() == null ? null : String.valueOf(alias.getValue());
+    }
+
+    private static String identifierValue(IdentifierCollection ids, Form form)
+    {
+        if(ids == null || form == null)
+        {
+            return null;
+        }
+        List<Identifier> list = ids.getIdentifiers(form);
+        if(list == null || list.isEmpty())
+        {
+            return null;
+        }
+        Identifier identifier = list.get(0);
+        if(identifier == null || identifier.getValue() == null)
+        {
+            return null;
+        }
+        Object value = identifier.getValue();
+        if(value instanceof Number number)
+        {
+            int numeric = number.intValue();
+            if(form == Form.SYSTEM || form == Form.WACN || form == Form.NETWORK_ACCESS_CODE)
+            {
+                return Integer.toHexString(numeric).toUpperCase(Locale.ROOT);
+            }
+            return String.valueOf(numeric);
+        }
+        String text = String.valueOf(value).trim();
+        return text.isEmpty() ? null : text;
     }
 
     private static void field(StringBuilder sb, String name, String value)
